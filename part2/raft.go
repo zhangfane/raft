@@ -188,6 +188,21 @@ type RequestVoteReply struct {
 }
 
 // RequestVote RPC.
+// 预投票优化
+// 发生网络分区时，处于离线的节点会因为没有收到心跳，而让自己转为候选人发起选票申请。
+// 当然，他处于离线状态，肯定是无法获取到足够的选票成为leader的，但因为网络分区他一直没有收到leader的心跳，自己会不断的尝试成为候选人去拉票。
+// 每一次拉票都会把自身的任期加大，导致这个节点的任期会一直递增。
+// 在网络分区恢复，由于自身的任期足够大，重新拉取选票时，会逼迫leader退位为follower，但是他肯定无法成为leader。
+// 原来的leader 想要再次成为leader 必须要保证自己的任期是集群内最大的，那么原来的leader会不断的重新拉票，直到任期追平。
+// 优化的方案就是，预投票， candidate要先发起一轮预投票， leader收到预投票的请求不会退位，只有当candidate预选票成功（过半）时，才发起真正的拉票。
+// 这样在发生网络分区时，处于离线的节点不会发生任期暴涨的问题
+//
+// 法定人数检测： leader主动退位机制，leader 检查follower的联通性，如果活跃的follower达不到quorum，那么自己肯定不可能是leader了，退位成follower
+// 发生网络分区时，原有的leader处于离线， 任然认为自己是leader， 而在线的节点中因为没有收到leader的心跳，重新选出了leader。
+// 原leader认为自己是leader倒也没啥，收到写请求时，因为拉不到足够的选票通过 提案，所以肯定写不进去，读请求也是一样的。
+// 但如果读请求绕过提案机制，直接找原leader读数据的话，就有问题了， 由于读请求很多raft集群为了读快一点，不走提案流程，认为leader的数据就是最新的，那么如果出现网络分区时，出现双leader，
+// 读到的数据就不一定是最新的了，法定人数检测就是为了在网络分区发生时，不合格的leader自动退位，以避免读请求不走提案流程 读到了旧数据。
+
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -256,6 +271,11 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		// Does our log contain an entry at PrevLogIndex whose term matches
 		// PrevLogTerm? Note that in the extreme case of PrevLogIndex=-1 this is
 		// vacuously true.
+		// 如果预写日志进度小于leader，同时检查上一条 预写日志的任期和索引是否一致。
+		// 这里就能保证leader 和follower预写日志的 顺序、内容是完全一致的。
+		// 如果上一条预写日志的索引和任期不一致，必定是follower的预写日志进度落后于leader
+		// 此时follower回复失败，leader收到失败后就会倒推上一条预写日志，然后重发，还不一致就继续循环倒推重发
+		// 直到leader给的上一条预写日志 索引和任期都一致，
 		if args.PrevLogIndex == -1 ||
 			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
 			reply.Success = true
@@ -263,13 +283,19 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			// Find an insertion point - where there's a term mismatch between
 			// the existing log starting at PrevLogIndex+1 and the new entries sent
 			// in the RPC.
+			// 查找自身预写日志插入点，即从 PrevLogIndex+1 开始的现有日志与 RPC 中发送的预写日志之间存在任期不匹配的地方。
 			logInsertIndex := args.PrevLogIndex + 1
+			// 查找leader预写日志待同步点，即leader给的预写日志数组中，从哪里开始同步
+			// 对比自身（follower）预写日志数组和leader的预写日志数组中，任期不一致的起始点（leader给的预写日志数组）
 			newEntriesIndex := 0
 
 			for {
+				// 如果插入点到了自身预写日志数组的末尾，跳出循环，意味着follower的预写日志进度和leader知道的是一样的，leader传过来的预写日志全部都要存下来
+				// 如果待同步点到了leader给的预写日志数组的末尾，跳出循环，意味着leader传过来的预写日志都已经有了，都不需要存下来
 				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
 					break
 				}
+				// 如果自身插入点对应的预写日志，其任期和leader给的预写日志任期不一致，跳出循环，就从自身预写日志数组这个地方开始同步leader的预写日志数据
 				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
 					break
 				}
@@ -281,6 +307,9 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			//   term mismatches with an entry from the leader
 			// - newEntriesIndex points at the end of Entries, or an index where the
 			//   term mismatches with the corresponding log entry
+			//	logInsertIndex 指向日志末尾，或任期与leader预写日志数组不匹配的数组下标。 自身的预写日志数组下标，从在这里开始同步预写日志
+			//	newEntriesIndex 指向预写日志数组末尾，或指向任期与leader预写日志数组不匹配的数组下标。leader的预写日志数组下标，待同步的预写日志
+			// 	同步预写日志
 			if newEntriesIndex < len(args.Entries) {
 				cm.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
 				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
@@ -288,6 +317,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 
 			// Set commit index.
+			// 更新已提交的预写日志索引
 			if args.LeaderCommit > cm.commitIndex {
 				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
 				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
@@ -302,6 +332,10 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 }
 
 // electionTimeout generates a pseudo-random election timeout duration.
+// leader lease， 如果一个follower 收到了leader的心跳，在心跳超时前，不会给其他节点投票。
+// 不完全网络分区场景
+// Node1 和Node 3 相通、Node2 和Node3 相通，Node1和Node2不通。 https://blog.mrcroxx.com/posts/code-reading/etcdraft-made-simple/3-election/#12-check-quorum
+
 func (cm *ConsensusModule) electionTimeout() time.Duration {
 	// If RAFT_FORCE_MORE_REELECTION is set, stress-test by deliberately
 	// generating a hard-coded number very often. This will create collisions
@@ -319,6 +353,16 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 // This function is blocking and should be launched in a separate goroutine;
 // it's designed to work for a single (one-shot) election timer, as it exits
 // whenever the CM state changes from follower/candidate or the term changes.
+// 永远无法恢复场景
+// 在启用leader lease 和 quorum check 优化，不启用quorum check， 发生网络分区时，离线节点的任期会不断增长，在网络分区恢复后，就会出现这种情况
+// 离线节点的任期高， 他收到leader的日志同步请求，将不会同步日志，因为leader的任期低于它，当leader 收到这个离线节点的回复，发现集群内有任期高于他的，将主动为follower。
+// 集群内将不断发起选举，直到任期追平，然后某个节点因日志的索引更大，而成为leader
+// 离线节点发起的选主lease check机制，其他节点可以收到leader的心跳不会投任何票，也无法成为主。
+// todo 似乎不管有没有lease check机制，离线节点恢复后岂不是都没啥用了？
+
+// 那么这个离线过的节点，将永远停止工作，即使他身处集群之中。
+// 启用pre vote机制时，
+
 func (cm *ConsensusModule) runElectionTimer() {
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
@@ -337,12 +381,13 @@ func (cm *ConsensusModule) runElectionTimer() {
 		<-ticker.C
 
 		cm.mu.Lock()
+		// 角色发生变化
 		if cm.state != Candidate && cm.state != Follower {
 			cm.dlog("in election timer state=%s, bailing out", cm.state)
 			cm.mu.Unlock()
 			return
 		}
-
+		// 任期发生变化
 		if termStarted != cm.currentTerm {
 			cm.dlog("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
 			cm.mu.Unlock()
@@ -351,6 +396,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 		// Start an election if we haven't heard from a leader or haven't voted for
 		// someone for the duration of the timeout.
+		// 心跳超时
 		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
 			cm.startElection()
 			cm.mu.Unlock()
@@ -486,12 +532,12 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			entries := cm.log[ni:]
 
 			args := AppendEntriesArgs{
-				Term:         savedCurrentTerm,
+				Term:         savedCurrentTerm, // leader当前的任期
 				LeaderId:     cm.id,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
+				PrevLogIndex: prevLogIndex, // 自己记录的follower预写日志进度
+				PrevLogTerm:  prevLogTerm,  // 上面预写日志的的任期
 				Entries:      entries,
-				LeaderCommit: cm.commitIndex,
+				LeaderCommit: cm.commitIndex, // leader当前的提交进度
 			}
 			cm.mu.Unlock()
 			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
@@ -507,10 +553,12 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 
 				if cm.state == Leader && savedCurrentTerm == reply.Term {
 					if reply.Success {
+						// 记录follower节点的预写日志进度
 						cm.nextIndex[peerId] = ni + len(entries)
+						// 记录follower节点已提交进度
 						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
 						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, cm.nextIndex, cm.matchIndex)
-
+						// 如果集群内过半的节点回复确认，那么就认为可以提交了，更新自身（leader）已提交的进度。
 						savedCommitIndex := cm.commitIndex
 						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
 							if cm.log[i].Term == cm.currentTerm {
